@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  dp-sidecar-db:
+    image: postgres:17
+    container_name: dp-sidecar-db
+    environment:
+      POSTGRES_USER: dp_user
+      POSTGRES_PASSWORD: dp_password
+      POSTGRES_DB: dp_sidecar
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./src/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - dp_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dp_user"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  dp_data:
