@@ -80,11 +80,11 @@ class BudgetTracker:
                 UPDATE epsilon_budget
                 SET epsilon_remaining = epsilon_remaining - %s,
                     is_locked = CASE 
-                        WHEN (epsilon_remaining - %s) < %s THEN TRUE 
+                        WHEN (epsilon_remaining - %s) < 0 THEN TRUE 
                         ELSE FALSE 
                     END,
                     locked_at = CASE 
-                        WHEN (epsilon_remaining - %s) < %s THEN NOW() 
+                        WHEN (epsilon_remaining - %s) < 0 THEN NOW() 
                         ELSE locked_at 
                     END,
                     last_updated = NOW()
