@@ -1,6 +1,12 @@
 """
 Main API for DP Sidecar - Differential Privacy for Fider Voting
 Provides endpoints to query DP-protected vote counts.
+
+KEY DESIGN:
+1. API queries trigger silent draft updates (pre-compute noise)
+2. Users only see PUBLISHED releases (from previous scheduler run)
+3. Scheduler runs at midnight to publish drafts
+4. Prevents timing attacks while maintaining fresh noise
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +25,7 @@ from .budget_tracker import BudgetTracker
 app = FastAPI(
     title="DP Sidecar API",
     description="Differential Privacy layer for Fider voting platform",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # Enable CORS for frontend
@@ -47,7 +53,9 @@ class DPCountResponse(BaseModel):
     message: str
     confidence_interval: Optional[dict] = None
     is_locked: bool = False
+    is_stale: bool = False
     window_id: Optional[int] = None
+    last_updated: Optional[str] = None
 
 
 # ===== WINDOW MANAGEMENT =====
@@ -91,31 +99,89 @@ def get_current_window(conn):
     window_id = cursor.fetchone()['window_id']
     conn.commit()
     
-    print(f"Created new window {window_id}: {now} to {end_time}")
+    print(f"📅 Created new window {window_id}: {now} to {end_time}")
     
     return window_id
 
 
-def store_dp_release(post_id: int, window_id: int, true_count: int, 
-                     noisy_count: Optional[float], epsilon_used: float, 
-                     meets_threshold: bool, conn):
-    """Store a DP release in the database"""
+# ===== DRAFT UPDATE LOGIC =====
+
+def _update_draft_release(post_id: int, window_id: int, conn):
+    """
+    SILENT background helper: Pre-compute noisy count if vote changed.
+    Stores as 'draft' - NOT visible to users yet!
+    
+    This runs on every API call but doesn't affect the response.
+    Users still see published data from previous window.
+    """
     cursor = conn.cursor()
     
+    # Get current true count from Fider
+    true_count = get_true_count_from_fider(post_id)
+    
+    # Check if we already have a draft for this window
     cursor.execute("""
-        INSERT INTO dp_releases 
-        (post_id, window_id, true_count, noisy_count, epsilon_used, meets_threshold)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        SELECT true_count, noisy_count, meets_threshold
+        FROM dp_releases
+        WHERE post_id = %s AND window_id = %s AND status = 'draft'
+    """, (post_id, window_id))
+    
+    existing_draft = cursor.fetchone()
+    
+    # If draft exists and count unchanged, do nothing
+    if existing_draft and existing_draft['true_count'] == true_count:
+        return  # No change - keep existing draft
+    
+    # Count changed! Need to update draft
+    
+    # Check threshold
+    if not dp_mechanism.check_threshold(true_count):
+        # Below threshold - store draft with NULL
+        cursor.execute("""
+            INSERT INTO dp_releases
+            (post_id, window_id, true_count, noisy_count, 
+             epsilon_used, meets_threshold, status)
+            VALUES (%s, %s, %s, NULL, 0.0, FALSE, 'draft')
+            ON CONFLICT (post_id, window_id)
+            DO UPDATE SET
+                true_count = EXCLUDED.true_count,
+                noisy_count = NULL,
+                meets_threshold = FALSE,
+                epsilon_used = 0.0,
+                updated_at = NOW()
+        """, (post_id, window_id, true_count))
+        conn.commit()
+        print(f"📝 Draft: Post {post_id} below threshold ({true_count} votes)")
+        return
+    
+    # Check budget
+    has_budget, remaining = budget_tracker.check_budget(post_id, window_id, EPSILON_PER_QUERY)
+    if not has_budget:
+        print(f"⚠️ Post {post_id} budget exhausted (remaining: {remaining:.2f})")
+        return
+    
+    # Generate NEW noise (this is pre-computed but not shown yet!)
+    noisy_count = dp_mechanism.add_laplace_noise(true_count)
+    
+    # Store as DRAFT (status='draft' means not visible to users)
+    cursor.execute("""
+        INSERT INTO dp_releases
+        (post_id, window_id, true_count, noisy_count, 
+         epsilon_used, meets_threshold, status)
+        VALUES (%s, %s, %s, %s, %s, TRUE, 'draft')
         ON CONFLICT (post_id, window_id)
         DO UPDATE SET
             true_count = EXCLUDED.true_count,
             noisy_count = EXCLUDED.noisy_count,
-            epsilon_used = epsilon_budget.epsilon_used + EXCLUDED.epsilon_used,
-            meets_threshold = EXCLUDED.meets_threshold,
+            epsilon_used = dp_releases.epsilon_used + EXCLUDED.epsilon_used,
+            meets_threshold = TRUE,
             updated_at = NOW()
-    """, (post_id, window_id, true_count, noisy_count, epsilon_used, meets_threshold))
+    """, (post_id, window_id, true_count, noisy_count, EPSILON_PER_QUERY))
     
     conn.commit()
+    
+    change_type = "initial" if not existing_draft else f"{existing_draft['true_count']}→{true_count}"
+    print(f"📝 Draft updated: Post {post_id} ({change_type}), noisy={noisy_count:.2f} [NOT PUBLISHED YET]")
 
 
 # ===== API ENDPOINTS =====
@@ -126,7 +192,7 @@ def health_check():
     return {
         "status": "ok",
         "service": "DP Sidecar",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "demo_mode": DEMO_MODE
     }
 
@@ -136,199 +202,189 @@ def get_dp_count(post_id: int):
     """
     Get DP-protected count for a post.
     
-    Key Privacy Feature:
-    - Returns SAME noisy value if vote count hasn't changed
-    - Generates NEW noise ONLY when vote count changes
-    - This prevents averaging attacks
+    KEY PRIVACY FEATURE:
+    - Returns PUBLISHED data from scheduler (prevents timing attacks)
+    - Silently updates draft in background (pre-computes noise)
+    - Users see data from last window release, not real-time
     
     Args:
         post_id: The Fider post ID
         
     Returns:
-        DPCountResponse with noisy count or threshold message
+        DPCountResponse with published noisy count
     """
     with get_dp_connection() as dp_conn:
         cursor = dp_conn.cursor()
         
         try:
-            # Step 1: Quick check if post is locked
+            # Step 1: Get current window
+            current_window_id = get_current_window(dp_conn)
+            
+            # Step 2: Check if post is locked (quick check)
             if budget_tracker.is_locked(post_id):
-                # Post is locked - return last known count
+                # Post is locked - return last published count
                 cursor.execute("""
-                    SELECT noisy_count, updated_at, window_id
+                    SELECT noisy_count, updated_at, window_id, meets_threshold
                     FROM dp_releases
-                    WHERE post_id = %s
-                    ORDER BY updated_at DESC
+                    WHERE post_id = %s AND status = 'published'
+                    ORDER BY window_id DESC
                     LIMIT 1
                 """, (post_id,))
                 
                 last_release = cursor.fetchone()
                 
-                return DPCountResponse(
-                    post_id=post_id,
-                    noisy_count=round(last_release['noisy_count'], 1) if last_release else None,
-                    epsilon_used=0.0,
-                    meets_threshold=True,
-                    message="Privacy budget exhausted. Showing last available count.",
-                    is_locked=True,
-                    window_id=last_release['window_id'] if last_release else None
-                )
-            
-            # Step 2: Get current window
-            current_window_id = get_current_window(dp_conn)
-            
-            # Step 3: Get true count from Fider
-            true_count = get_true_count_from_fider(post_id)
-            
-            # Step 4: Check threshold
-            if not dp_mechanism.check_threshold(true_count):
-                # Below threshold - check if we've already stored this status
-                cursor.execute("""
-                    SELECT release_id
-                    FROM dp_releases
-                    WHERE post_id = %s AND window_id = %s
-                """, (post_id, current_window_id))
-                
-                if not cursor.fetchone():
-                    # Store the "below threshold" status for this window
-                    store_dp_release(post_id, current_window_id, true_count, 
-                                   None, 0.0, False, dp_conn)
-                
-                return DPCountResponse(
-                    post_id=post_id,
-                    noisy_count=None,
-                    epsilon_used=0.0,
-                    meets_threshold=False,
-                    message=f"Not enough voters (minimum: {THRESHOLD})",
-                    window_id=current_window_id
-                )
-            
-            # Step 5: Check if we have existing release for this post in this window
-            cursor.execute("""
-                SELECT release_id, true_count, noisy_count, epsilon_used
-                FROM dp_releases
-                WHERE post_id = %s AND window_id = %s
-            """, (post_id, current_window_id))
-            
-            existing = cursor.fetchone()
-            
-            if existing is None:
-                # CASE 1: First query for this post in this window
-                # Check budget
-                has_budget, remaining = budget_tracker.check_budget(
-                    post_id, current_window_id, EPSILON_PER_QUERY
-                )
-                
-                if not has_budget:
+                if last_release and last_release['meets_threshold']:
+                    return DPCountResponse(
+                        post_id=post_id,
+                        noisy_count=round(last_release['noisy_count'], 1),
+                        epsilon_used=0.0,
+                        meets_threshold=True,
+                        message="Privacy budget exhausted. Showing last available count.",
+                        is_locked=True,
+                        window_id=last_release['window_id'],
+                        last_updated=str(last_release['updated_at'])
+                    )
+                else:
                     return DPCountResponse(
                         post_id=post_id,
                         noisy_count=None,
                         epsilon_used=0.0,
                         meets_threshold=False,
-                        message="Privacy budget exhausted",
+                        message="Not enough voters (minimum: 15)",
                         is_locked=True,
                         window_id=current_window_id
                     )
+            
+            # Step 3: Check for PUBLISHED release in current window
+            cursor.execute("""
+                SELECT noisy_count, meets_threshold, updated_at
+                FROM dp_releases
+                WHERE post_id = %s AND window_id = %s AND status = 'published'
+            """, (post_id, current_window_id))
+            
+            current_published = cursor.fetchone()
+            
+            if current_published:
+                # We have published data for current window!
+                # (This means scheduler already ran for this window)
                 
-                # Generate new noise
-                noisy_count = dp_mechanism.add_laplace_noise(true_count)
+                # Still update draft silently for next window
+                _update_draft_release(post_id, current_window_id, dp_conn)
                 
-                # Store release
-                store_dp_release(post_id, current_window_id, true_count, 
-                               noisy_count, EPSILON_PER_QUERY, True, dp_conn)
-                
-                # Deduct budget
-                budget_tracker.deduct_budget(post_id, current_window_id, EPSILON_PER_QUERY)
-                
-                # Calculate confidence interval
-                lower, upper = dp_mechanism.calculate_confidence_interval(noisy_count)
-                
-                print(f"New release: Post {post_id}, true={true_count}, noisy={noisy_count:.2f}")
+                if current_published['meets_threshold']:
+                    noisy = current_published['noisy_count']
+                    lower, upper = dp_mechanism.calculate_confidence_interval(noisy)
+                    
+                    return DPCountResponse(
+                        post_id=post_id,
+                        noisy_count=round(noisy, 1),
+                        epsilon_used=0.0,  # Not consuming new budget on read
+                        meets_threshold=True,
+                        message="Current window release",
+                        confidence_interval={"lower": round(lower, 1), "upper": round(upper, 1)},
+                        window_id=current_window_id,
+                        last_updated=str(current_published['updated_at'])
+                    )
+                else:
+                    return DPCountResponse(
+                        post_id=post_id,
+                        noisy_count=None,
+                        epsilon_used=0.0,
+                        meets_threshold=False,
+                        message="Not enough voters (minimum: 15)",
+                        window_id=current_window_id
+                    )
+            
+            # Step 4: No published data for current window yet
+            # This means we're still in the middle of a window
+            # Return data from PREVIOUS window (stale but safe!)
+            
+            # First, update draft for next release (silent)
+            _update_draft_release(post_id, current_window_id, dp_conn)
+            
+            # Get most recent published release
+            cursor.execute("""
+                SELECT noisy_count, meets_threshold, window_id, updated_at
+                FROM dp_releases
+                WHERE post_id = %s AND status = 'published'
+                ORDER BY window_id DESC
+                LIMIT 1
+            """, (post_id,))
+            
+            previous_published = cursor.fetchone()
+            
+            if previous_published and previous_published['meets_threshold']:
+                # Return previous window's data
+                noisy = previous_published['noisy_count']
+                lower, upper = dp_mechanism.calculate_confidence_interval(noisy)
                 
                 return DPCountResponse(
                     post_id=post_id,
-                    noisy_count=round(max(0, noisy_count), 1),
-                    epsilon_used=EPSILON_PER_QUERY,
+                    noisy_count=round(noisy, 1),
+                    epsilon_used=0.0,
                     meets_threshold=True,
-                    message="New release generated",
+                    message="Showing previous window data (new release pending)",
                     confidence_interval={"lower": round(lower, 1), "upper": round(upper, 1)},
+                    is_stale=True,
+                    window_id=previous_published['window_id'],
+                    last_updated=str(previous_published['updated_at'])
+                )
+            else:
+                # No previous data OR previous was below threshold
+                return DPCountResponse(
+                    post_id=post_id,
+                    noisy_count=None,
+                    epsilon_used=0.0,
+                    meets_threshold=False,
+                    message="Not enough voters (minimum: 15)",
                     window_id=current_window_id
                 )
-            
-            else:
-                stored_true_count = existing['true_count']
-                stored_noisy_count = existing['noisy_count']
-                
-                if stored_true_count == true_count:
-                    # CASE 2: NO NEW VOTES
-                    # Return same noisy count (CRITICAL FOR PRIVACY!)
-                    
-                    print(f"Cached: Post {post_id}, noisy={stored_noisy_count:.2f} (no change)")
-                    
-                    lower, upper = dp_mechanism.calculate_confidence_interval(stored_noisy_count)
-                    
-                    return DPCountResponse(
-                        post_id=post_id,
-                        noisy_count=round(max(0, stored_noisy_count), 1),
-                        epsilon_used=0.0,  # No new epsilon used
-                        meets_threshold=True,
-                        message="Cached (no new votes)",
-                        confidence_interval={"lower": round(lower, 1), "upper": round(upper, 1)},
-                        window_id=current_window_id
-                    )
-                
-                else:
-                    # CASE 3: NEW VOTE DETECTED
-                    # Check budget
-                    has_budget, remaining = budget_tracker.check_budget(
-                        post_id, current_window_id, EPSILON_PER_QUERY
-                    )
-                    
-                    if not has_budget:
-                        # Budget exhausted - return last known
-                        return DPCountResponse(
-                            post_id=post_id,
-                            noisy_count=round(max(0, stored_noisy_count), 1),
-                            epsilon_used=0.0,
-                            meets_threshold=True,
-                            message="Privacy budget exhausted. Showing last count.",
-                            is_locked=True,
-                            window_id=current_window_id
-                        )
-                    
-                    # Regenerate noise with new count
-                    noisy_count = dp_mechanism.add_laplace_noise(true_count)
-                    
-                    # Update release
-                    store_dp_release(post_id, current_window_id, true_count, 
-                                   noisy_count, EPSILON_PER_QUERY, True, dp_conn)
-                    
-                    # Deduct budget
-                    budget_tracker.deduct_budget(post_id, current_window_id, EPSILON_PER_QUERY)
-                    
-                    lower, upper = dp_mechanism.calculate_confidence_interval(noisy_count)
-                    
-                    print(f"Updated: Post {post_id}, {stored_true_count}→{true_count}, noisy={noisy_count:.2f}")
-                    
-                    return DPCountResponse(
-                        post_id=post_id,
-                        noisy_count=round(max(0, noisy_count), 1),
-                        epsilon_used=EPSILON_PER_QUERY,
-                        meets_threshold=True,
-                        message=f"Updated (vote change: {stored_true_count}→{true_count})",
-                        confidence_interval={"lower": round(lower, 1), "upper": round(upper, 1)},
-                        window_id=current_window_id
-                    )
         
         except Exception as e:
-            print(f"Error in get_dp_count: {e}")
+            print(f"❌ Error in get_dp_count: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/budget/{post_id}", tags=["Admin"])
+def get_budget_info(post_id: int):
+    """
+    Admin endpoint: Check budget status for a post.
+    """
+    with get_dp_connection() as dp_conn:
+        cursor = dp_conn.cursor()
+        window_id = get_current_window(dp_conn)
+        
+        cursor.execute("""
+            SELECT epsilon_remaining, monthly_epsilon_cap, is_locked, locked_at
+            FROM epsilon_budget
+            WHERE post_id = %s AND window_id = %s
+        """, (post_id, window_id))
+        
+        budget = cursor.fetchone()
+        
+        if not budget:
+            return {
+                "post_id": post_id,
+                "window_id": window_id,
+                "epsilon_remaining": None,
+                "message": "No budget entry (post not yet queried)"
+            }
+        
+        return {
+            "post_id": post_id,
+            "window_id": window_id,
+            "epsilon_remaining": round(budget['epsilon_remaining'], 2),
+            "monthly_epsilon_cap": budget['monthly_epsilon_cap'],
+            "is_locked": budget['is_locked'],
+            "locked_at": str(budget['locked_at']) if budget['locked_at'] else None,
+            "queries_remaining": int(budget['epsilon_remaining'] / EPSILON_PER_QUERY)
+        }
 
 
 @app.get("/api/debug/post/{post_id}", tags=["Debug"])
 def debug_post(post_id: int):
     """
-    Debug endpoint to see both true and noisy counts.
+    Debug endpoint: See both true and noisy counts.
     ⚠️ REMOVE THIS IN PRODUCTION!
     """
     with get_dp_connection() as dp_conn:
@@ -337,27 +393,55 @@ def debug_post(post_id: int):
         window_id = get_current_window(dp_conn)
         true_count = get_true_count_from_fider(post_id)
         
+        # Get draft
         cursor.execute("""
-            SELECT true_count, noisy_count, epsilon_used, updated_at, meets_threshold
+            SELECT true_count, noisy_count, epsilon_used, meets_threshold, status, updated_at
             FROM dp_releases
-            WHERE post_id = %s AND window_id = %s
+            WHERE post_id = %s AND window_id = %s AND status = 'draft'
         """, (post_id, window_id))
+        draft = cursor.fetchone()
         
-        release = cursor.fetchone()
+        # Get published
+        cursor.execute("""
+            SELECT true_count, noisy_count, epsilon_used, meets_threshold, status, updated_at
+            FROM dp_releases
+            WHERE post_id = %s AND window_id = %s AND status = 'published'
+        """, (post_id, window_id))
+        published = cursor.fetchone()
         
         return {
             "post_id": post_id,
             "window_id": window_id,
-            "current_true_count": true_count,
+            "current_true_count_from_fider": true_count,
             "threshold": THRESHOLD,
-            "stored_release": {
-                "true_count": release['true_count'] if release else None,
-                "noisy_count": release['noisy_count'] if release else None,
-                "epsilon_used": release['epsilon_used'] if release else None,
-                "meets_threshold": release['meets_threshold'] if release else None,
-                "updated_at": str(release['updated_at']) if release else None
-            } if release else None
+            "draft_release": {
+                "true_count": draft['true_count'] if draft else None,
+                "noisy_count": draft['noisy_count'] if draft else None,
+                "epsilon_used": draft['epsilon_used'] if draft else None,
+                "meets_threshold": draft['meets_threshold'] if draft else None,
+                "updated_at": str(draft['updated_at']) if draft else None
+            } if draft else None,
+            "published_release": {
+                "true_count": published['true_count'] if published else None,
+                "noisy_count": published['noisy_count'] if published else None,
+                "epsilon_used": published['epsilon_used'] if published else None,
+                "meets_threshold": published['meets_threshold'] if published else None,
+                "updated_at": str(published['updated_at']) if published else None
+            } if published else None
         }
+
+
+# ===== STARTUP =====
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize scheduler on startup"""
+    from .window_scheduler import start_scheduler
+    start_scheduler()
+    print("✅ DP Sidecar API started")
+    print(f"   Mode: {'DEMO' if DEMO_MODE else 'PRODUCTION'}")
+    print(f"   Threshold: {THRESHOLD} votes")
+    print(f"   Epsilon per query: {EPSILON_PER_QUERY}")
 
 
 if __name__ == "__main__":

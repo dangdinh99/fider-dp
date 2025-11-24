@@ -15,7 +15,7 @@ WINDOW_TYPE = 'daily'           # 'daily' or 'demo'
 WINDOW_RESET_TIME = "00:00"     # Midnight (format: "HH:MM")
 
 # Demo mode: For live demonstrations (short windows)
-DEMO_MODE = False               # Set True for demo
+DEMO_MODE = True               # Set True for demo
 DEMO_WINDOW_SECONDS = 30        # Short windows for demo
 
 # ===== DATABASE CONNECTIONS =====

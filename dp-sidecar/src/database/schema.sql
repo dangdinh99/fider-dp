@@ -26,6 +26,16 @@ CREATE TABLE IF NOT EXISTS dp_releases (
     UNIQUE(post_id, window_id)  -- One release per post per window
 );
 
+ALTER TABLE dp_releases 
+ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'draft';
+
+-- Add index for fast status lookups
+CREATE INDEX IF NOT EXISTS idx_dp_releases_status 
+ON dp_releases(post_id, window_id, status);
+
+-- Update existing rows to be 'published' (migration)
+UPDATE dp_releases SET status = 'published' WHERE status IS NULL;
+
 CREATE INDEX IF NOT EXISTS idx_dp_releases_post_window 
 ON dp_releases(post_id, window_id);
 
