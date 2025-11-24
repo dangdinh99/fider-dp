@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS dp_releases (
     post_id INTEGER NOT NULL,
     window_id INTEGER REFERENCES release_windows(window_id),
     true_count INTEGER NOT NULL,
-    noisy_count FLOAT NOT NULL,
+    noisy_count FLOAT,
     epsilon_used FLOAT NOT NULL,
     meets_threshold BOOLEAN DEFAULT FALSE,
     released_at TIMESTAMP DEFAULT NOW(),
