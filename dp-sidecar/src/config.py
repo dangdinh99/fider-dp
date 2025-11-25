@@ -3,7 +3,7 @@ Configuration for DP parameters and database connections.
 """
 
 # ===== DP PARAMETERS =====
-THRESHOLD = 15                  # Minimum votes before releasing count
+THRESHOLD = 1                  # Minimum votes before releasing count
 EPSILON_PER_QUERY = 0.5         # Privacy budget per release
 SENSITIVITY = 1                 # One vote per user
 MONTHLY_EPSILON_CAP = 20.0      # Maximum epsilon per post per month
