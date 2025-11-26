@@ -62,7 +62,13 @@ class DPCountResponse(BaseModel):
 
 def get_current_window(conn):
     """
-    Get or create the current active release window.
+    Get the current active release window.
+    
+    IMPORTANT: Does NOT create new windows!
+    Only the scheduler should create windows.
+    
+    Returns:
+        window_id of current active window, or None if no active window
     """
     cursor = conn.cursor()
     
@@ -80,30 +86,24 @@ def get_current_window(conn):
     if result:
         return result['window_id']
     
-    # No active window - create new one
-    now = datetime.now()
-    
-    if DEMO_MODE:
-        # Demo mode: short windows
-        end_time = now + timedelta(seconds=DEMO_WINDOW_SECONDS)
-    else:
-        # Production: daily windows
-        end_time = now + timedelta(hours=24)
-    
+    # No active window found
+    # Return the most recent closed window instead
     cursor.execute("""
-        INSERT INTO release_windows (start_time, end_time, status)
-        VALUES (%s, %s, 'active')
-        RETURNING window_id
-    """, (now, end_time))
+        SELECT window_id
+        FROM release_windows
+        WHERE status = 'closed'
+        ORDER BY window_id DESC
+        LIMIT 1
+    """)
     
-    window_id = cursor.fetchone()['window_id']
-    conn.commit()
+    result = cursor.fetchone()
     
-    print(f"📅 Created new window {window_id}: {now} to {end_time}")
+    if result:
+        return result['window_id']
     
-    return window_id
-
-
+    # No windows at all - this should only happen on very first startup
+    # Return None and let the scheduler create the first window
+    return None
 
 
 
@@ -125,16 +125,7 @@ def get_dp_count(post_id: int):
     """
     Get DP-protected count for a post.
     
-    KEY PRIVACY FEATURE:
-    - Returns PUBLISHED data from scheduler (prevents timing attacks)
-    - Silently updates draft in background (pre-computes noise)
-    - Users see data from last window release, not real-time
-    
-    Args:
-        post_id: The Fider post ID
-        
-    Returns:
-        DPCountResponse with published noisy count
+    FIXED: Now tracks new posts so scheduler can process them!
     """
     with get_dp_connection() as dp_conn:
         cursor = dp_conn.cursor()
@@ -143,9 +134,73 @@ def get_dp_count(post_id: int):
             # Step 1: Get current window
             current_window_id = get_current_window(dp_conn)
             
-            # Step 2: Check if post is locked (quick check)
+            if current_window_id is None:
+                # No windows yet - wait for scheduler to create first one
+                return DPCountResponse(
+                    post_id=post_id,
+                    noisy_count=None,
+                    epsilon_used=0.0,
+                    meets_threshold=False,
+                    message="System initializing. Please wait for first scheduler run.",
+                    window_id=None
+                )
+            
+            # Step 2: Check if this post has EVER been tracked
+            cursor.execute("""
+                SELECT COUNT(*) as count
+                FROM dp_releases
+                WHERE post_id = %s
+            """, (post_id,))
+            
+            has_any_releases = cursor.fetchone()['count'] > 0
+            
+            # Step 3: If post is NEW, add initial tracking entry
+            if not has_any_releases:
+                print(f"📝 New post detected: {post_id} - Adding to tracking")
+                
+                # Get true count from Fider
+                true_count = get_true_count_from_fider(post_id)
+                
+                # Check if meets threshold
+                meets_threshold = dp_mechanism.check_threshold(true_count)
+                
+                if meets_threshold:
+                    # Add initial entry for scheduler to find
+                    # Mark as 'draft' - scheduler will publish it
+                    cursor.execute("""
+                        INSERT INTO dp_releases
+                        (post_id, window_id, true_count, noisy_count, 
+                         epsilon_used, meets_threshold, status)
+                        VALUES (%s, %s, %s, NULL, 0.0, TRUE, 'draft')
+                        ON CONFLICT (post_id, window_id) DO NOTHING
+                    """, (post_id, current_window_id, true_count))
+                    
+                    dp_conn.commit()
+                    
+                    print(f"✓ Post {post_id} added to tracking (true_count={true_count})")
+                    print(f"  Scheduler will publish it on next run (~30s)")
+                    
+                    return DPCountResponse(
+                        post_id=post_id,
+                        noisy_count=None,
+                        epsilon_used=0.0,
+                        meets_threshold=True,
+                        message="Post added to tracking. Noisy count will be available after next scheduler run (~30 seconds).",
+                        window_id=current_window_id
+                    )
+                else:
+                    # Below threshold - still track it but don't publish
+                    return DPCountResponse(
+                        post_id=post_id,
+                        noisy_count=None,
+                        epsilon_used=0.0,
+                        meets_threshold=False,
+                        message=f"Not enough voters (minimum: {dp_mechanism.threshold})",
+                        window_id=current_window_id
+                    )
+            
+            # Step 4: Post is already tracked - check if locked
             if budget_tracker.is_locked(post_id):
-                # Post is locked - return last published count
                 cursor.execute("""
                     SELECT noisy_count, updated_at, window_id, meets_threshold
                     FROM dp_releases
@@ -173,12 +228,12 @@ def get_dp_count(post_id: int):
                         noisy_count=None,
                         epsilon_used=0.0,
                         meets_threshold=False,
-                        message="Not enough voters (minimum: 15)",
+                        message=f"Not enough voters (minimum: {dp_mechanism.threshold})",
                         is_locked=True,
                         window_id=current_window_id
                     )
             
-            # Step 3: Check for PUBLISHED release in current window
+            # Step 5: Check for PUBLISHED release in current window
             cursor.execute("""
                 SELECT noisy_count, meets_threshold, updated_at
                 FROM dp_releases
@@ -188,11 +243,6 @@ def get_dp_count(post_id: int):
             current_published = cursor.fetchone()
             
             if current_published:
-                # We have published data for current window!
-                # (This means scheduler already ran for this window)
-                
-                # Still update draft silently for next window
-                
                 if current_published['meets_threshold']:
                     noisy = current_published['noisy_count']
                     lower, upper = dp_mechanism.calculate_confidence_interval(noisy)
@@ -200,7 +250,7 @@ def get_dp_count(post_id: int):
                     return DPCountResponse(
                         post_id=post_id,
                         noisy_count=round(noisy, 1),
-                        epsilon_used=0.0,  # Not consuming new budget on read
+                        epsilon_used=0.0,
                         meets_threshold=True,
                         message="Current window release",
                         confidence_interval={"lower": round(lower, 1), "upper": round(upper, 1)},
@@ -213,16 +263,11 @@ def get_dp_count(post_id: int):
                         noisy_count=None,
                         epsilon_used=0.0,
                         meets_threshold=False,
-                        message="Not enough voters (minimum: 15)",
+                        message=f"Not enough voters (minimum: {dp_mechanism.threshold})",
                         window_id=current_window_id
                     )
             
-            # Step 4: No published data for current window yet
-            # This means we're still in the middle of a window
-            # Return data from PREVIOUS window (stale but safe!)
-            
-            # First, update draft for next release (silent)
-            # Get most recent published release
+            # Step 6: No published data for current window - return previous window data
             cursor.execute("""
                 SELECT noisy_count, meets_threshold, window_id, updated_at
                 FROM dp_releases
@@ -234,7 +279,6 @@ def get_dp_count(post_id: int):
             previous_published = cursor.fetchone()
             
             if previous_published and previous_published['meets_threshold']:
-                # Return previous window's data
                 noisy = previous_published['noisy_count']
                 lower, upper = dp_mechanism.calculate_confidence_interval(noisy)
                 
@@ -250,13 +294,12 @@ def get_dp_count(post_id: int):
                     last_updated=str(previous_published['updated_at'])
                 )
             else:
-                # No previous data OR previous was below threshold
                 return DPCountResponse(
                     post_id=post_id,
                     noisy_count=None,
                     epsilon_used=0.0,
                     meets_threshold=False,
-                    message="Not enough voters (minimum: 15)",
+                    message=f"Not enough voters (minimum: {dp_mechanism.threshold})",
                     window_id=current_window_id
                 )
         
