@@ -60,7 +60,7 @@ class BudgetTracker:
             # Check if enough budget
             return epsilon_remaining >= epsilon_needed, epsilon_remaining
     
-    def deduct_budget(self, post_id: int, window_id: int, epsilon_used: float) -> float:
+    def deduct_budget(self, post_id: int, window_id: int, epsilon_used: float, conn=None) -> float:
         """
         Deduct epsilon from budget after a query.
         
@@ -68,40 +68,49 @@ class BudgetTracker:
             post_id: The post ID
             window_id: The release window
             epsilon_used: Amount of epsilon consumed
+            conn: Optional existing connection to reuse (avoids deadlock)
             
         Returns:
             Remaining epsilon budget
         """
-        with get_dp_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Deduct budget and check if should lock
-            cursor.execute("""
-                UPDATE epsilon_budget
-                SET epsilon_remaining = epsilon_remaining - %s,
-                    is_locked = CASE 
-                        WHEN (epsilon_remaining - %s) < %s THEN TRUE 
-                        ELSE FALSE 
-                    END,
-                    locked_at = CASE 
-                        WHEN (epsilon_remaining - %s) < %s THEN NOW() 
-                        ELSE locked_at 
-                    END,
-                    last_updated = NOW()
-                WHERE post_id = %s AND window_id = %s
-                RETURNING epsilon_remaining, is_locked
-            """, (epsilon_used, epsilon_used, EPSILON_PER_QUERY, 
-                  epsilon_used, EPSILON_PER_QUERY, post_id, window_id))
-            
-            result = cursor.fetchone()
-            conn.commit()
-            
-            if result:
-                if result['is_locked']:
-                    print(f"⚠️ Post {post_id} budget exhausted! Locked.")
-                return result['epsilon_remaining']
-            else:
-                raise Exception(f"Budget entry not found for post {post_id}, window {window_id}")
+        # Use provided connection or create new one
+        if conn is None:
+            with get_dp_connection() as new_conn:
+                return self._do_deduct(new_conn, post_id, window_id, epsilon_used)
+        else:
+            return self._do_deduct(conn, post_id, window_id, epsilon_used)
+
+    def _do_deduct(self, conn, post_id: int, window_id: int, epsilon_used: float) -> float:
+        """Helper method that does the actual deduction"""
+        cursor = conn.cursor()
+        
+        # Deduct budget and check if should lock
+        cursor.execute("""
+            UPDATE epsilon_budget
+            SET epsilon_remaining = epsilon_remaining - %s,
+                is_locked = CASE 
+                    WHEN (epsilon_remaining - %s) < %s THEN TRUE 
+                    ELSE FALSE 
+                END,
+                locked_at = CASE 
+                    WHEN (epsilon_remaining - %s) < %s THEN NOW() 
+                    ELSE locked_at 
+                END,
+                last_updated = NOW()
+            WHERE post_id = %s AND window_id = %s
+            RETURNING epsilon_remaining, is_locked
+        """, (epsilon_used, epsilon_used, EPSILON_PER_QUERY, 
+            epsilon_used, EPSILON_PER_QUERY, post_id, window_id))
+        
+        result = cursor.fetchone()
+        # Don't commit here - let caller handle commit
+        
+        if result:
+            if result['is_locked']:
+                print(f"⚠️ Post {post_id} budget exhausted! Locked.")
+            return result['epsilon_remaining']
+        else:
+            raise Exception(f"Budget entry not found for post {post_id}, window {window_id}")
     
     def get_remaining_budget(self, post_id: int, window_id: int) -> Optional[float]:
         """

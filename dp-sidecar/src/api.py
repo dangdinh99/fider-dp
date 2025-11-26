@@ -104,131 +104,7 @@ def get_current_window(conn):
     return window_id
 
 
-# ===== DRAFT UPDATE LOGIC =====
 
-def _update_draft_release(post_id: int, window_id: int, conn):
-    """
-    SILENT background helper: Pre-compute noisy count if vote changed.
-
-    New behavior:
-    - If true_count did NOT change since last published/draft → do NOTHING.
-    - Only create/update a draft when:
-        * true_count >= THRESHOLD, and
-        * true_count differs from the last known true_count.
-    - This means:
-        * Noise stays the same across windows if there are no new votes.
-        * Epsilon is only spent when the underlying count changes and a draft
-          is eventually published.
-    """
-    cursor = conn.cursor()
-
-    # 1) Get current true count from Fider
-    true_count = get_true_count_from_fider(post_id)
-
-    # 2) If below threshold, do nothing (no drafts, no budget)
-    if not dp_mechanism.check_threshold(true_count):
-        # Optional: debug print
-        # print(f"⚪ Post {post_id}: true_count={true_count} below threshold, no draft.")
-        return
-
-    # 3) Check if we already have a draft for THIS window
-    cursor.execute("""
-        SELECT true_count, noisy_count, meets_threshold
-        FROM dp_releases
-        WHERE post_id = %s AND window_id = %s AND status = 'draft'
-    """, (post_id, window_id))
-    existing_draft = cursor.fetchone()
-
-    # If draft exists and count unchanged, do nothing
-    if existing_draft and existing_draft['true_count'] == true_count:
-        # No change in truth → keep existing draft as-is
-        return
-
-    # 4) If no draft, check the LAST PUBLISHED release (any window)
-    if not existing_draft:
-        cursor.execute("""
-            SELECT true_count, noisy_count
-            FROM dp_releases
-            WHERE post_id = %s AND status = 'published'
-            ORDER BY window_id DESC
-            LIMIT 1
-        """, (post_id,))
-        last_published = cursor.fetchone()
-
-        # If count hasn't changed from last published, do NOTHING.
-        # We will reuse that published value across windows via the API fallback.
-        if last_published and last_published['true_count'] == true_count:
-            # Optional: debug print to reassure ourselves
-            print(f"🟢 Post {post_id}: true_count={true_count} unchanged since last published, "
-                  "no new draft created (noise & epsilon unchanged).")
-            return
-
-    # 5) At this point:
-    #    - Either there was no published value, or
-    #    - true_count changed since last published/draft.
-    #    → We need a NEW DP value for this window.
-
-    # Check budget for this post+window
-    has_budget, remaining = budget_tracker.check_budget(post_id, window_id, EPSILON_PER_QUERY)
-    if not has_budget:
-        print(f"⚠️ Post {post_id} budget exhausted (remaining: {remaining:.2f}), no draft created.")
-        return
-
-    # Generate NEW noise (pre-computed but not visible yet)
-    noisy_count = dp_mechanism.add_laplace_noise(true_count)
-
-    # Store/overwrite as DRAFT (status='draft' means not visible to users yet)
-    cursor.execute("""
-        INSERT INTO dp_releases
-        (post_id, window_id, true_count, noisy_count, 
-         epsilon_used, meets_threshold, status)
-        VALUES (%s, %s, %s, %s, %s, TRUE, 'draft')
-        ON CONFLICT (post_id, window_id)
-        DO UPDATE SET
-            true_count = EXCLUDED.true_count,
-            noisy_count = EXCLUDED.noisy_count,
-            epsilon_used = EXCLUDED.epsilon_used,
-            meets_threshold = TRUE,
-            updated_at = NOW()
-    """, (post_id, window_id, true_count, noisy_count, EPSILON_PER_QUERY))
-    conn.commit()
-
-    change_type = (
-        "initial"
-        if not existing_draft
-        else f"{existing_draft['true_count']}→{true_count}"
-    )
-    print(f"📝 Draft updated: Post {post_id} ({change_type}), "
-          f"true_count={true_count}, noisy={noisy_count:.2f} [NOT PUBLISHED YET]")
-    
-    # Check budget
-    has_budget, remaining = budget_tracker.check_budget(post_id, window_id, EPSILON_PER_QUERY)
-    if not has_budget:
-        print(f"⚠️ Post {post_id} budget exhausted (remaining: {remaining:.2f})")
-        return
-    
-    # Generate NEW noise (this is pre-computed but not shown yet!)
-    noisy_count = dp_mechanism.add_laplace_noise(true_count)
-    
-    # Store as DRAFT (status='draft' means not visible to users)
-    cursor.execute("""
-        INSERT INTO dp_releases
-        (post_id, window_id, true_count, noisy_count, 
-         epsilon_used, meets_threshold, status)
-        VALUES (%s, %s, %s, %s, %s, TRUE, 'draft')
-        ON CONFLICT (post_id, window_id)
-        DO UPDATE SET
-            true_count = EXCLUDED.true_count,
-            noisy_count = EXCLUDED.noisy_count,
-            epsilon_used = dp_releases.epsilon_used + EXCLUDED.epsilon_used,
-            meets_threshold = TRUE,
-            updated_at = NOW()
-    """, (post_id, window_id, true_count, noisy_count, EPSILON_PER_QUERY))
-    
-    conn.commit()
-    
-    change_type = "initial" if not existing_draft else f"{existing_draft['true_count']}→{true_count}"
-    print(f"📝 Draft updated: Post {post_id} ({change_type}), noisy={noisy_count:.2f} [NOT PUBLISHED YET]")
 
 
 # ===== API ENDPOINTS =====
@@ -316,7 +192,6 @@ def get_dp_count(post_id: int):
                 # (This means scheduler already ran for this window)
                 
                 # Still update draft silently for next window
-                _update_draft_release(post_id, current_window_id, dp_conn)
                 
                 if current_published['meets_threshold']:
                     noisy = current_published['noisy_count']
@@ -347,8 +222,6 @@ def get_dp_count(post_id: int):
             # Return data from PREVIOUS window (stale but safe!)
             
             # First, update draft for next release (silent)
-            _update_draft_release(post_id, current_window_id, dp_conn)
-            
             # Get most recent published release
             cursor.execute("""
                 SELECT noisy_count, meets_threshold, window_id, updated_at

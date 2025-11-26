@@ -20,10 +20,12 @@ budget_tracker = BudgetTracker()
 
 def publish_window_releases():
     """
-    Main scheduled job: Publish all draft releases.
+    Batch scheduler: Reads counts, generates noise, publishes.
     
-    This runs at window boundaries (midnight in production, every 30s in demo).
-    It makes pre-computed noisy counts visible to users.
+    KEY BEHAVIOR:
+    - Only generates NEW noise when true_count changed since last published
+    - If count unchanged → reuses previous noisy_count (no new epsilon!)
+    - All logic in one place (no drafts)
     """
     print(f"\n{'='*70}")
     print(f"🕐 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Publishing window releases...")
@@ -33,6 +35,7 @@ def publish_window_releases():
         cursor = conn.cursor()
         
         # Step 1: Get current active window
+        print("DEBUG: Getting active window...")
         cursor.execute("""
             SELECT window_id, start_time, end_time
             FROM release_windows
@@ -55,81 +58,157 @@ def publish_window_releases():
         print(f"📅 Processing window {window_id}")
         print(f"   Period: {start_time} to {end_time}")
         
-        # Step 2: Get all draft releases for this window
+        # Step 2: Get posts (just use tracked posts)
+        print("DEBUG: Getting tracked posts...")
         cursor.execute("""
-            SELECT post_id, true_count, noisy_count, epsilon_used, meets_threshold
+            SELECT DISTINCT post_id
             FROM dp_releases
-            WHERE window_id = %s AND status = 'draft'
-            ORDER BY post_id
-        """, (window_id,))
+        """)
+        active_posts = cursor.fetchall()
         
-        drafts = cursor.fetchall()
+        print(f"DEBUG: Found {len(active_posts)} tracked posts")
         
-        if not drafts:
-            print("   No drafts to publish")
+        if not active_posts:
+            print("   No tracked posts found")
         else:
-            print(f"   Found {len(drafts)} drafts to publish:")
+            print(f"   Found {len(active_posts)} posts to process")
         
         published_count = 0
+        reused_count = 0
         locked_count = 0
+        below_threshold_count = 0
         
-        # Step 3: Publish each draft
-        for draft in drafts:
-            post_id = draft['post_id']
-            epsilon = draft['epsilon_used']
-            noisy = draft['noisy_count']
-            meets_threshold = draft['meets_threshold']
+        # Step 3: Import dependencies inside function
+        from .database.connections import get_true_count_from_fider
+        from .dp_mechanism import DPMechanism
+        
+        dp_mechanism = DPMechanism()
+        
+        # Step 4: Process each post
+        print("DEBUG: Starting post loop...")
+        for idx, post_row in enumerate(active_posts):
+            post_id = post_row['post_id']
+            print(f"DEBUG: Processing post {idx+1}/{len(active_posts)}: post_id={post_id}")
             
             try:
-                # Deduct epsilon budget NOW (when actually publishing)
-                if epsilon > 0:
-                    remaining = budget_tracker.deduct_budget(post_id, window_id, epsilon)
-                    
-                    if remaining < EPSILON_PER_QUERY:
-                        locked_count += 1
-                        status_icon = "🔒"
-                    else:
-                        status_icon = "✅"
-                else:
-                    status_icon = "⬇️"  # Below threshold
+                # Get current true count
+                print(f"DEBUG:   Getting true count for post {post_id}...")
+                true_count = get_true_count_from_fider(post_id)
+                print(f"DEBUG:   True count: {true_count}")
                 
-                # Mark draft as published
+                # Check threshold
+                if not dp_mechanism.check_threshold(true_count):
+                    print(f"DEBUG:   Below threshold, skipping")
+                    below_threshold_count += 1
+                    continue
+                
+                # Get last published
+                print(f"DEBUG:   Getting last published...")
                 cursor.execute("""
-                    UPDATE dp_releases
-                    SET status = 'published'
-                    WHERE post_id = %s AND window_id = %s AND status = 'draft'
-                """, (post_id, window_id))
+                    SELECT true_count, noisy_count
+                    FROM dp_releases
+                    WHERE post_id = %s AND status = 'published'
+                    ORDER BY window_id DESC
+                    LIMIT 1
+                """, (post_id,))
                 
+                last_published = cursor.fetchone()
+                print(f"DEBUG:   Last published: {last_published}")
+                
+                # Check if count unchanged
+                if last_published and last_published['true_count'] == true_count:
+                    print(f"DEBUG:   Count unchanged, reusing...")
+                    previous_noisy = last_published['noisy_count']
+                    
+                    # Store with ZERO epsilon
+                    cursor.execute("""
+                        INSERT INTO dp_releases
+                        (post_id, window_id, true_count, noisy_count, 
+                         epsilon_used, meets_threshold, status)
+                        VALUES (%s, %s, %s, %s, 0.0, TRUE, 'published')
+                        ON CONFLICT (post_id, window_id)
+                        DO UPDATE SET 
+                            noisy_count = EXCLUDED.noisy_count, 
+                            status = 'published',
+                            updated_at = NOW()
+                    """, (post_id, window_id, true_count, previous_noisy))
+                    
+                    reused_count += 1
+                    print(f"   📌 Post {post_id}: {previous_noisy:.2f} (reused, ε=0.0)")
+                    continue
+                
+                # Count changed - need new noise!
+                print(f"DEBUG:   Count changed, generating new noise...")
+                noisy_count = dp_mechanism.add_laplace_noise(true_count)
+                print(f"DEBUG:   Noisy count: {noisy_count:.2f}")
+                
+                # Check budget (also initializes if needed)
+                print(f"DEBUG:   Checking budget...")
+                has_budget, remaining = budget_tracker.check_budget(
+                    post_id, window_id, EPSILON_PER_QUERY
+                )
+                
+                if not has_budget:
+                    print(f"   🔒 Post {post_id}: Budget exhausted (remaining: {remaining:.2f})")
+                    locked_count += 1
+                    continue
+                
+                # Store as published
+                print(f"DEBUG:   Storing release...")
+                cursor.execute("""
+                    INSERT INTO dp_releases
+                    (post_id, window_id, true_count, noisy_count, 
+                     epsilon_used, meets_threshold, status)
+                    VALUES (%s, %s, %s, %s, %s, TRUE, 'published')
+                    ON CONFLICT (post_id, window_id)
+                    DO UPDATE SET
+                        true_count = EXCLUDED.true_count,
+                        noisy_count = EXCLUDED.noisy_count,
+                        epsilon_used = EXCLUDED.epsilon_used,
+                        status = 'published',
+                        updated_at = NOW()
+                """, (post_id, window_id, true_count, noisy_count, EPSILON_PER_QUERY))
+                
+                # Deduct budget
+                print(f"DEBUG:   Deducting budget...")
+                budget_tracker.deduct_budget(post_id, window_id, EPSILON_PER_QUERY, conn)
+                
+                # Success - increment counter
                 published_count += 1
-                
-                if meets_threshold:
-                    print(f"   {status_icon} Post {post_id:4d}: {noisy:6.2f} (ε={epsilon:.1f})")
-                else:
-                    print(f"   {status_icon} Post {post_id:4d}: Below threshold")
+                change_type = "new" if not last_published else f"{last_published['true_count']}→{true_count}"
+                print(f"   ✅ Post {post_id}: {noisy_count:.2f} ({change_type}, ε=0.5)")
                 
             except Exception as e:
-                print(f"   ❌ Post {post_id}: Error - {e}")
+                print(f"   ❌ Post {post_id}: ERROR - {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
-        conn.commit()
+        print("DEBUG: Post loop completed")
         
-        # Step 4: Close current window
+        # Commit all changes
+        conn.commit()
+        print("DEBUG: Committed changes")
+        
+        # Step 5: Close current window
         cursor.execute("""
-            UPDATE release_windows
-            SET status = 'closed'
-            WHERE window_id = %s
+            UPDATE release_windows SET status = 'closed' WHERE window_id = %s
         """, (window_id,))
         conn.commit()
+        print("DEBUG: Closed window")
         
+        # Step 6: Summary
         print(f"\n📊 Summary:")
-        print(f"   Published: {published_count} releases")
+        print(f"   New releases: {published_count}")
+        print(f"   Reused (no change): {reused_count}")
+        if below_threshold_count > 0:
+            print(f"   Below threshold: {below_threshold_count}")
         if locked_count > 0:
-            print(f"   🔒 Locked: {locked_count} posts (budget exhausted)")
+            print(f"   🔒 Locked: {locked_count}")
         
-        # Step 5: Create new window
+        # Step 7: Create new window
         new_window_id = _create_new_window(conn)
-        
-        print(f"✅ Window {window_id} closed, new window {new_window_id} created")
+        print(f"✅ Done! New window: {new_window_id}")
         print(f"{'='*70}\n")
 
 
