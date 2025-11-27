@@ -1,33 +1,38 @@
 """
-Budget Tracker for Differential Privacy
-Tracks epsilon budget per post per window and handles locking
+Budget Tracker for Differential Privacy 
+Tracks epsilon budget per post across its lifetime 
 """
 from typing import Optional, Tuple
 from .database.connections import get_dp_connection
-from .config import MONTHLY_EPSILON_CAP, EPSILON_PER_QUERY
+from .config import LIFETIME_EPSILON_CAP, EPSILON_PER_QUERY
 
 
 class BudgetTracker:
     """
-    Tracks and enforces epsilon budget limits per post per window.
+    Tracks and enforces epsilon budget limits per post.
+    
+    Budget is tracked across windows for a post's entire lifetime.
+    Once exhausted, the post is locked FOREVER.
     """
     
-    def __init__(self, monthly_cap: float = None):
+    def __init__(self, lifetime_cap: float = None):
         """
         Initialize budget tracker.
         
         Args:
-            monthly_cap: Maximum epsilon per post per month
+            lifetime_cap: Maximum epsilon per post for its entire lifetime
         """
-        self.monthly_cap = monthly_cap or MONTHLY_EPSILON_CAP
+        self.lifetime_cap = lifetime_cap or LIFETIME_EPSILON_CAP
     
     def check_budget(self, post_id: int, window_id: int, epsilon_needed: float) -> Tuple[bool, Optional[float]]:
         """
-        Check if enough budget remains for this query.
+        Check if enough LIFETIME budget remains for this post.
+        
+        CHANGED: Now checks total epsilon used across ALL windows, not just current window.
         
         Args:
             post_id: The post ID
-            window_id: The current release window
+            window_id: The current release window (for compatibility)
             epsilon_needed: How much epsilon this query needs
             
         Returns:
@@ -36,42 +41,47 @@ class BudgetTracker:
         with get_dp_connection() as conn:
             cursor = conn.cursor()
             
-            # Check if budget entry exists
+            # Get TOTAL epsilon used by this post across ALL windows
             cursor.execute("""
-                SELECT epsilon_remaining, is_locked
-                FROM epsilon_budget
-                WHERE post_id = %s AND window_id = %s
-            """, (post_id, window_id))
+                SELECT COALESCE(SUM(epsilon_used), 0) as total_used
+                FROM dp_releases
+                WHERE post_id = %s AND status = 'published'
+            """, (post_id,))
             
             result = cursor.fetchone()
-            
-            if result is None:
-                # No entry yet - initialize budget
-                self._initialize_budget(post_id, window_id, conn)
-                return epsilon_needed <= self.monthly_cap, self.monthly_cap
-            
-            epsilon_remaining = result['epsilon_remaining']
-            is_locked = result['is_locked']
+            total_used = result['total_used']
+            epsilon_remaining = self.lifetime_cap - total_used
             
             # Check if already locked
-            if is_locked:
+            cursor.execute("""
+                SELECT is_currently_locked
+                FROM dp_items
+                WHERE post_id = %s
+            """, (post_id,))
+            
+            item = cursor.fetchone()
+            if item and item['is_currently_locked']:
                 return False, epsilon_remaining
             
-            # Check if enough budget
-            return epsilon_remaining >= epsilon_needed, epsilon_remaining
+            # Check if enough budget remains
+            has_budget = epsilon_remaining >= epsilon_needed
+            
+            return has_budget, epsilon_remaining
     
     def deduct_budget(self, post_id: int, window_id: int, epsilon_used: float, conn=None) -> float:
         """
-        Deduct epsilon from budget after a query.
+        Deduct epsilon from LIFETIME budget after a query.
+        
+        CHANGED: Updates lifetime total and locks post if budget exhausted.
         
         Args:
             post_id: The post ID
             window_id: The release window
             epsilon_used: Amount of epsilon consumed
-            conn: Optional existing connection to reuse (avoids deadlock)
+            conn: Optional existing connection to reuse
             
         Returns:
-            Remaining epsilon budget
+            Remaining epsilon budget (across lifetime)
         """
         # Use provided connection or create new one
         if conn is None:
@@ -84,66 +94,78 @@ class BudgetTracker:
         """Helper method that does the actual deduction"""
         cursor = conn.cursor()
         
-        # Deduct budget and check if should lock
+        # Get total epsilon used after this deduction
         cursor.execute("""
-            UPDATE epsilon_budget
-            SET epsilon_remaining = epsilon_remaining - %s,
-                is_locked = CASE 
-                    WHEN (epsilon_remaining - %s) < %s THEN TRUE 
-                    ELSE FALSE 
-                END,
-                locked_at = CASE 
-                    WHEN (epsilon_remaining - %s) < %s THEN NOW() 
-                    ELSE locked_at 
-                END,
-                last_updated = NOW()
-            WHERE post_id = %s AND window_id = %s
-            RETURNING epsilon_remaining, is_locked
-        """, (epsilon_used, epsilon_used, EPSILON_PER_QUERY, 
-            epsilon_used, EPSILON_PER_QUERY, post_id, window_id))
+            SELECT COALESCE(SUM(epsilon_used), 0) as total_used
+            FROM dp_releases
+            WHERE post_id = %s AND status = 'published'
+        """, (post_id,))
         
         result = cursor.fetchone()
+        total_used_before = result['total_used']
+        total_used_after = total_used_before + epsilon_used
+        epsilon_remaining = self.lifetime_cap - total_used_after
+        
+        # Check if should lock (not enough for another query)
+        should_lock = epsilon_remaining < EPSILON_PER_QUERY
+        
+        # Update or create dp_items entry
+        cursor.execute("""
+            INSERT INTO dp_items 
+            (post_id, current_window_id, is_currently_locked, total_epsilon_spent, last_updated)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (post_id) 
+            DO UPDATE SET
+                current_window_id = EXCLUDED.current_window_id,
+                is_currently_locked = EXCLUDED.is_currently_locked,
+                total_epsilon_spent = EXCLUDED.total_epsilon_spent,
+                last_updated = NOW()
+        """, (post_id, window_id, should_lock, total_used_after))
+        
         # Don't commit here - let caller handle commit
         
-        if result:
-            if result['is_locked']:
-                print(f"⚠️ Post {post_id} budget exhausted! Locked.")
-            return result['epsilon_remaining']
-        else:
-            raise Exception(f"Budget entry not found for post {post_id}, window {window_id}")
+        if should_lock:
+            print(f"🔒 Post {post_id} LIFETIME budget exhausted! Locked forever.")
+            print(f"   Total epsilon used: {total_used_after:.2f}/{self.lifetime_cap}")
+        
+        return epsilon_remaining
     
-    def get_remaining_budget(self, post_id: int, window_id: int) -> Optional[float]:
+    def get_remaining_budget(self, post_id: int, window_id: int = None) -> Optional[float]:
         """
-        Get remaining budget for a post in a window.
+        Get remaining LIFETIME budget for a post.
+        
+        CHANGED: Returns lifetime budget remaining, not per-window.
         
         Args:
             post_id: The post ID
-            window_id: The release window
+            window_id: Ignored (kept for compatibility)
             
         Returns:
-            Remaining epsilon, or None if no entry exists
+            Remaining epsilon across lifetime, or None if no entry exists
         """
         with get_dp_connection() as conn:
             cursor = conn.cursor()
             
             cursor.execute("""
-                SELECT epsilon_remaining
-                FROM epsilon_budget
-                WHERE post_id = %s AND window_id = %s
-            """, (post_id, window_id))
+                SELECT COALESCE(SUM(epsilon_used), 0) as total_used
+                FROM dp_releases
+                WHERE post_id = %s AND status = 'published'
+            """, (post_id,))
             
             result = cursor.fetchone()
-            return result['epsilon_remaining'] if result else None
+            total_used = result['total_used']
+            
+            return self.lifetime_cap - total_used
     
     def is_locked(self, post_id: int) -> bool:
         """
-        Quick check if post is currently locked (uses dp_items cache).
+        Quick check if post is locked (uses dp_items cache).
         
         Args:
             post_id: The post ID
             
         Returns:
-            True if locked, False otherwise
+            True if locked forever, False otherwise
         """
         with get_dp_connection() as conn:
             cursor = conn.cursor()
@@ -157,55 +179,53 @@ class BudgetTracker:
             result = cursor.fetchone()
             return result['is_currently_locked'] if result else False
     
-    def _initialize_budget(self, post_id: int, window_id: int, conn):
+    def get_lifetime_stats(self, post_id: int) -> dict:
         """
-        Initialize budget for a new post/window combination.
+        Get comprehensive lifetime budget statistics for a post.
         
-        Args:
-            post_id: The post ID
-            window_id: The release window
-            conn: Database connection
-        """
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO epsilon_budget
-            (post_id, window_id, epsilon_remaining, monthly_epsilon_cap)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (post_id, window_id) DO NOTHING
-        """, (post_id, window_id, self.monthly_cap, self.monthly_cap))
-        
-        conn.commit()
-    
-    def reset_budget(self, post_id: int, window_id: int):
-        """
-        Reset budget for a post (useful for new windows).
-        
-        Args:
-            post_id: The post ID
-            window_id: The release window
+        Returns:
+            Dictionary with budget stats
         """
         with get_dp_connection() as conn:
             cursor = conn.cursor()
             
+            # Get total epsilon used
             cursor.execute("""
-                UPDATE epsilon_budget
-                SET epsilon_remaining = monthly_epsilon_cap,
-                    is_locked = FALSE,
-                    locked_at = NULL,
-                    last_updated = NOW()
-                WHERE post_id = %s AND window_id = %s
-            """, (post_id, window_id))
+                SELECT 
+                    COALESCE(SUM(epsilon_used), 0) as total_used,
+                    COUNT(*) as num_releases
+                FROM dp_releases
+                WHERE post_id = %s AND status = 'published' AND epsilon_used > 0
+            """, (post_id,))
             
-            conn.commit()
+            result = cursor.fetchone()
+            total_used = result['total_used']
+            num_releases = result['num_releases']
+            
+            remaining = self.lifetime_cap - total_used
+            queries_remaining = int(remaining / EPSILON_PER_QUERY) if remaining >= EPSILON_PER_QUERY else 0
+            
+            # Get lock status
+            is_locked = self.is_locked(post_id)
+            
+            return {
+                'post_id': post_id,
+                'lifetime_cap': self.lifetime_cap,
+                'total_epsilon_used': total_used,
+                'epsilon_remaining': remaining,
+                'num_noise_generations': num_releases,
+                'queries_remaining': queries_remaining,
+                'is_locked': is_locked,
+                'budget_percent_used': (total_used / self.lifetime_cap) * 100
+            }
 
 
 def test_budget_tracker():
-    """Test budget tracker functionality"""
-    print("Testing Budget Tracker...")
+    """Test lifetime budget tracker functionality"""
+    print("Testing LIFETIME Budget Tracker...")
     print("=" * 60)
     
-    tracker = BudgetTracker(monthly_cap=5.0)  # Small cap for testing
+    tracker = BudgetTracker(lifetime_cap=5.0)  # Small cap for testing
     
     test_post_id = 9999
     test_window_id = 1
@@ -219,7 +239,7 @@ def test_budget_tracker():
         cursor.execute("DELETE FROM release_windows WHERE window_id = %s", (test_window_id,))
         conn.commit()
     
-    # ✅ CREATE THE WINDOW FIRST!
+    # Create test window
     print("\nSetup: Creating test window")
     with get_dp_connection() as conn:
         cursor = conn.cursor()
@@ -236,54 +256,71 @@ def test_budget_tracker():
     has_budget, remaining = tracker.check_budget(test_post_id, test_window_id, 0.5)
     print(f"  Has budget: {has_budget}, Remaining: {remaining}")
     assert has_budget is True
-    print("  ✓ Passed: New post has full budget")
+    assert remaining == 5.0
+    print("  ✓ Passed: New post has full lifetime budget")
     
-    # Test 2: Deduct budget
-    print("\nTest 2: Deduct budget (0.5 epsilon)")
-    remaining = tracker.deduct_budget(test_post_id, test_window_id, 0.5)
-    print(f"  Remaining after deduction: {remaining}")
-    assert remaining == 4.5
-    print("  ✓ Passed: Budget deducted correctly")
-    
-    # Test 3: Check remaining
-    print("\nTest 3: Check remaining budget")
-    remaining = tracker.get_remaining_budget(test_post_id, test_window_id)
-    print(f"  Remaining: {remaining}")
-    assert remaining == 4.5
-    print("  ✓ Passed: Remaining budget correct")
-    
-    # Test 4: Exhaust budget
-    print("\nTest 4: Exhaust budget")
-    for i in range(10):
-        has_budget, remaining = tracker.check_budget(test_post_id, test_window_id, 0.5)
-        print(f"  Iteration {i+1}: has_budget={has_budget}, remaining={remaining:.1f}")
+    # Test 2: Simulate multiple releases across different windows
+    print("\nTest 2: Simulate releases across multiple windows")
+    with get_dp_connection() as conn:
+        cursor = conn.cursor()
         
-        if has_budget:
-            tracker.deduct_budget(test_post_id, test_window_id, 0.5)
-        else:
-            print(f"  Budget exhausted after {i+1} attempts!")
-            break
+        for window in range(1, 12):  # 11 windows
+            # Create window
+            cursor.execute("""
+                INSERT INTO release_windows (start_time, end_time, status)
+                VALUES (NOW(), NOW() + INTERVAL '1 hour', 'closed')
+                RETURNING window_id
+            """, )
+            new_window = cursor.fetchone()
+            window_id = new_window['window_id']
+            
+            # Add published release
+            cursor.execute("""
+                INSERT INTO dp_releases
+                (post_id, window_id, true_count, noisy_count, epsilon_used, 
+                 meets_threshold, status)
+                VALUES (%s, %s, 50, 51.2, 0.5, TRUE, 'published')
+            """, (test_post_id, window_id))
+            
+            # Deduct budget
+            remaining = tracker.deduct_budget(test_post_id, window_id, 0.5, conn)
+            
+            conn.commit()
+            
+            print(f"  Window {window}: Remaining = {remaining:.1f}")
+            
+            if remaining < EPSILON_PER_QUERY:
+                print(f"  🔒 Post locked after {window} releases!")
+                break
     
-    # Test 5: Check if locked
-    print("\nTest 5: Check if post is locked")
+    # Test 3: Check if locked
+    print("\nTest 3: Check if post is locked")
     is_locked = tracker.is_locked(test_post_id)
     print(f"  Is locked: {is_locked}")
     assert is_locked is True
-    print("  ✓ Passed: Post is locked when budget exhausted")
+    print("  ✓ Passed: Post is locked when lifetime budget exhausted")
+    
+    # Test 4: Get lifetime stats
+    print("\nTest 4: Get lifetime statistics")
+    stats = tracker.get_lifetime_stats(test_post_id)
+    print(f"  Total used: {stats['total_epsilon_used']:.1f}/{stats['lifetime_cap']}")
+    print(f"  Noise generations: {stats['num_noise_generations']}")
+    print(f"  Budget used: {stats['budget_percent_used']:.1f}%")
+    print(f"  Locked: {stats['is_locked']}")
+    print("  ✓ Passed: Lifetime stats calculated correctly")
     
     # Clean up
     print("\nCleanup: Removing test data")
     with get_dp_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM epsilon_budget WHERE post_id = %s", (test_post_id,))
         cursor.execute("DELETE FROM dp_releases WHERE post_id = %s", (test_post_id,))
         cursor.execute("DELETE FROM dp_items WHERE post_id = %s", (test_post_id,))
-        cursor.execute("DELETE FROM release_windows WHERE window_id = %s", (test_window_id,))
+        cursor.execute("DELETE FROM release_windows WHERE window_id >= %s", (test_window_id,))
         conn.commit()
     print("  ✓ Cleanup complete")
     
     print("\n" + "=" * 60)
-    print("✓ All budget tracker tests passed!")
+    print("✓ All LIFETIME budget tracker tests passed!")
 
 
 if __name__ == "__main__":

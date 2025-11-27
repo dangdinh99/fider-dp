@@ -6,7 +6,7 @@ Configuration for DP parameters and database connections.
 THRESHOLD = 1                  # Minimum votes before releasing count
 EPSILON_PER_QUERY = 0.5         # Privacy budget per release
 SENSITIVITY = 1                 # One vote per user
-MONTHLY_EPSILON_CAP = 20.0      # Maximum epsilon per post 
+LIFETIME_EPSILON_CAP = 20.0      # Maximum epsilon per post 
 
 # ===== RELEASE SCHEDULE =====
 WINDOW_TYPE = 'daily'           # 'daily' or 'demo'

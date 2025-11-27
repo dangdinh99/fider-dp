@@ -311,37 +311,24 @@ def get_dp_count(post_id: int):
 @app.get("/api/admin/budget/{post_id}", tags=["Admin"])
 def get_budget_info(post_id: int):
     """
-    Admin endpoint: Check budget status for a post.
+    Admin endpoint: Check LIFETIME budget status for a post.
+    
+    CHANGED: Now shows lifetime budget across all windows.
     """
-    with get_dp_connection() as dp_conn:
-        cursor = dp_conn.cursor()
-        window_id = get_current_window(dp_conn)
-        
-        cursor.execute("""
-            SELECT epsilon_remaining, monthly_epsilon_cap, is_locked, locked_at
-            FROM epsilon_budget
-            WHERE post_id = %s AND window_id = %s
-        """, (post_id, window_id))
-        
-        budget = cursor.fetchone()
-        
-        if not budget:
-            return {
-                "post_id": post_id,
-                "window_id": window_id,
-                "epsilon_remaining": None,
-                "message": "No budget entry (post not yet queried)"
-            }
-        
-        return {
-            "post_id": post_id,
-            "window_id": window_id,
-            "epsilon_remaining": round(budget['epsilon_remaining'], 2),
-            "monthly_epsilon_cap": budget['monthly_epsilon_cap'],
-            "is_locked": budget['is_locked'],
-            "locked_at": str(budget['locked_at']) if budget['locked_at'] else None,
-            "queries_remaining": int(budget['epsilon_remaining'] / EPSILON_PER_QUERY)
-        }
+    # Get comprehensive lifetime stats
+    stats = budget_tracker.get_lifetime_stats(post_id)
+    
+    return {
+        "post_id": stats['post_id'],
+        "lifetime_cap": stats['lifetime_cap'],
+        "total_epsilon_used": round(stats['total_epsilon_used'], 2),
+        "epsilon_remaining": round(stats['epsilon_remaining'], 2),
+        "budget_percent_used": round(stats['budget_percent_used'], 1),
+        "num_noise_generations": stats['num_noise_generations'],
+        "queries_remaining": stats['queries_remaining'],
+        "is_locked": stats['is_locked'],
+        "message": "LOCKED FOREVER - Final result" if stats['is_locked'] else "Active"
+    }
 
 
 @app.get("/api/debug/post/{post_id}", tags=["Debug"])

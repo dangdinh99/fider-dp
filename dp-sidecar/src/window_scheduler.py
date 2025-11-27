@@ -1,14 +1,8 @@
 """
-Window Scheduler - Publishes draft releases at scheduled times
+Window Scheduler 
 
-This module runs background jobs that:
-1. Close expired windows
-2. Publish all draft releases (mark status='published')
-3. Deduct epsilon from budgets
-4. Create new windows
-
-KEY: This is what prevents timing attacks!
-Users never see real-time changes - only scheduled publications.
+Now checks lifetime budget before publishing.
+Posts lock FOREVER once budget exhausted.
 """
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
@@ -22,10 +16,9 @@ def publish_window_releases():
     """
     Batch scheduler: Reads counts, generates noise, publishes.
     
-    KEY BEHAVIOR:
-    - Only generates NEW noise when true_count changed since last published
-    - If count unchanged → reuses previous noisy_count (no new epsilon!)
-    - All logic in one place (no drafts)
+    CHANGED: Now uses LIFETIME budget tracking.
+    - Posts lock FOREVER once budget exhausted
+    - Budget is tracked across ALL windows
     """
     print(f"\n{'='*70}")
     print(f"🕐 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Publishing window releases...")
@@ -35,7 +28,6 @@ def publish_window_releases():
         cursor = conn.cursor()
         
         # Step 1: Get current active window
-        print("DEBUG: Getting active window...")
         cursor.execute("""
             SELECT window_id, start_time, end_time
             FROM release_windows
@@ -58,15 +50,12 @@ def publish_window_releases():
         print(f"📅 Processing window {window_id}")
         print(f"   Period: {start_time} to {end_time}")
         
-        # Step 2: Get posts (just use tracked posts)
-        print("DEBUG: Getting tracked posts...")
+        # Step 2: Get tracked posts
         cursor.execute("""
             SELECT DISTINCT post_id
             FROM dp_releases
         """)
         active_posts = cursor.fetchall()
-        
-        print(f"DEBUG: Found {len(active_posts)} tracked posts")
         
         if not active_posts:
             print("   No tracked posts found")
@@ -78,32 +67,49 @@ def publish_window_releases():
         locked_count = 0
         below_threshold_count = 0
         
-        # Step 3: Import dependencies inside function
+        # Step 3: Import dependencies
         from .database.connections import get_true_count_from_fider
         from .dp_mechanism import DPMechanism
         
         dp_mechanism = DPMechanism()
         
         # Step 4: Process each post
-        print("DEBUG: Starting post loop...")
         for idx, post_row in enumerate(active_posts):
             post_id = post_row['post_id']
-            print(f"DEBUG: Processing post {idx+1}/{len(active_posts)}: post_id={post_id}")
             
             try:
                 # Get current true count
-                print(f"DEBUG:   Getting true count for post {post_id}...")
                 true_count = get_true_count_from_fider(post_id)
-                print(f"DEBUG:   True count: {true_count}")
                 
                 # Check threshold
                 if not dp_mechanism.check_threshold(true_count):
-                    print(f"DEBUG:   Below threshold, skipping")
                     below_threshold_count += 1
                     continue
                 
+                # CHANGED: Check LIFETIME budget (not per-window)
+                has_budget, remaining = budget_tracker.check_budget(
+                    post_id, window_id, EPSILON_PER_QUERY
+                )
+                
+                if not has_budget:
+                    print(f"   🔒 Post {post_id}: LIFETIME budget exhausted (remaining: {remaining:.2f})")
+                    locked_count += 1
+                    
+                    # Return last published count
+                    cursor.execute("""
+                        SELECT noisy_count, true_count
+                        FROM dp_releases
+                        WHERE post_id = %s AND status = 'published'
+                        ORDER BY window_id DESC
+                        LIMIT 1
+                    """, (post_id,))
+                    
+                    last = cursor.fetchone()
+                    if last:
+                        print(f"      Final noisy count: {last['noisy_count']:.2f} (true: {last['true_count']})")
+                    continue
+                
                 # Get last published
-                print(f"DEBUG:   Getting last published...")
                 cursor.execute("""
                     SELECT true_count, noisy_count
                     FROM dp_releases
@@ -113,14 +119,12 @@ def publish_window_releases():
                 """, (post_id,))
                 
                 last_published = cursor.fetchone()
-                print(f"DEBUG:   Last published: {last_published}")
                 
                 # Check if count unchanged
                 if last_published and last_published['true_count'] == true_count:
-                    print(f"DEBUG:   Count unchanged, reusing...")
                     previous_noisy = last_published['noisy_count']
                     
-                    # Store with ZERO epsilon
+                    # Store with ZERO epsilon (reusing noise)
                     cursor.execute("""
                         INSERT INTO dp_releases
                         (post_id, window_id, true_count, noisy_count, 
@@ -135,26 +139,13 @@ def publish_window_releases():
                     
                     reused_count += 1
                     print(f"   📌 Post {post_id}: {previous_noisy:.2f} (reused, ε=0.0)")
+                    print(f"      Lifetime remaining: {remaining:.2f}")
                     continue
                 
-                # Count changed - need new noise!
-                print(f"DEBUG:   Count changed, generating new noise...")
+                # Count changed - generate new noise!
                 noisy_count = dp_mechanism.add_laplace_noise(true_count)
-                print(f"DEBUG:   Noisy count: {noisy_count:.2f}")
-                
-                # Check budget (also initializes if needed)
-                print(f"DEBUG:   Checking budget...")
-                has_budget, remaining = budget_tracker.check_budget(
-                    post_id, window_id, EPSILON_PER_QUERY
-                )
-                
-                if not has_budget:
-                    print(f"   🔒 Post {post_id}: Budget exhausted (remaining: {remaining:.2f})")
-                    locked_count += 1
-                    continue
                 
                 # Store as published
-                print(f"DEBUG:   Storing release...")
                 cursor.execute("""
                     INSERT INTO dp_releases
                     (post_id, window_id, true_count, noisy_count, 
@@ -169,14 +160,13 @@ def publish_window_releases():
                         updated_at = NOW()
                 """, (post_id, window_id, true_count, noisy_count, EPSILON_PER_QUERY))
                 
-                # Deduct budget
-                print(f"DEBUG:   Deducting budget...")
-                budget_tracker.deduct_budget(post_id, window_id, EPSILON_PER_QUERY, conn)
+                # Deduct from LIFETIME budget
+                remaining_after = budget_tracker.deduct_budget(post_id, window_id, EPSILON_PER_QUERY, conn)
                 
-                # Success - increment counter
                 published_count += 1
                 change_type = "new" if not last_published else f"{last_published['true_count']}→{true_count}"
                 print(f"   ✅ Post {post_id}: {noisy_count:.2f} ({change_type}, ε=0.5)")
+                print(f"      Lifetime remaining: {remaining_after:.2f}")
                 
             except Exception as e:
                 print(f"   ❌ Post {post_id}: ERROR - {e}")
@@ -184,18 +174,14 @@ def publish_window_releases():
                 traceback.print_exc()
                 continue
         
-        print("DEBUG: Post loop completed")
-        
         # Commit all changes
         conn.commit()
-        print("DEBUG: Committed changes")
         
         # Step 5: Close current window
         cursor.execute("""
             UPDATE release_windows SET status = 'closed' WHERE window_id = %s
         """, (window_id,))
         conn.commit()
-        print("DEBUG: Closed window")
         
         # Step 6: Summary
         print(f"\n📊 Summary:")
@@ -204,7 +190,7 @@ def publish_window_releases():
         if below_threshold_count > 0:
             print(f"   Below threshold: {below_threshold_count}")
         if locked_count > 0:
-            print(f"   🔒 Locked: {locked_count}")
+            print(f"   🔒 Locked (LIFETIME budget exhausted): {locked_count}")
         
         # Step 7: Create new window
         new_window_id = _create_new_window(conn)
@@ -283,7 +269,7 @@ def start_scheduler():
             'interval',
             seconds=DEMO_WINDOW_SECONDS,
             id='demo_publisher',
-            max_instances=1  # Prevent overlapping runs
+            max_instances=1
         )
         print(f"🚀 Scheduler started (DEMO MODE: every {DEMO_WINDOW_SECONDS}s)")
     else:
