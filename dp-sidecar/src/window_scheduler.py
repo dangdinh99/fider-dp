@@ -138,8 +138,9 @@ def publish_window_releases():
                     """, (post_id, window_id, true_count, previous_noisy))
                     
                     reused_count += 1
-                    print(f"   📌 Post {post_id}: {previous_noisy:.2f} (reused, ε=0.0)")
-                    print(f"      Lifetime remaining: {remaining:.2f}")
+                    print(f"   📌 Post {post_id}: {previous_noisy:.2f} (reused)")
+                    print(f"      True count: {true_count} (unchanged)")
+                    print(f"      Budget remaining: {remaining:.2f}")
                     continue
                 
                 # Count changed - generate new noise!
@@ -165,8 +166,14 @@ def publish_window_releases():
                 
                 published_count += 1
                 change_type = "new" if not last_published else f"{last_published['true_count']}→{true_count}"
-                print(f"   ✅ Post {post_id}: {noisy_count:.2f} ({change_type}, ε=0.5)")
-                print(f"      Lifetime remaining: {remaining_after:.2f}")
+                print(f"   ✅ Post {post_id}: {noisy_count:.2f} ({change_type})")
+
+                # Show true count details
+                if not last_published:
+                    print(f"      True: {true_count}, Noisy: {noisy_count:.2f}")
+                else:
+                    print(f"      True: {last_published['true_count']} → {true_count}, Noisy: {noisy_count:.2f}")
+                print(f"      Budget remaining: {remaining_after:.2f}")
                 
             except Exception as e:
                 print(f"   ❌ Post {post_id}: ERROR - {e}")

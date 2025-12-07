@@ -383,15 +383,146 @@ def debug_post(post_id: int):
 
 # ===== STARTUP =====
 
+async def auto_track_all_posts():
+    """
+    Automatically track all posts from Fider on startup.
+    This eliminates the need to manually query each post.
+    """
+    import asyncio
+    
+    print("🔍 Auto-discovering posts from Fider...")
+    
+    try:
+        # Get all post IDs from Fider
+        with get_fider_connection() as fider_conn:
+            cursor = fider_conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, title 
+                FROM posts 
+                ORDER BY id
+            """)
+            posts = cursor.fetchall()
+            
+            if not posts:
+                print("   ⚠️ No posts found in Fider")
+                return
+            
+            print(f"   Found {len(posts)} posts in Fider")
+        
+        # Wait a moment for API to be fully ready
+        await asyncio.sleep(2)
+        
+        # Track each post by querying it internally
+        import httpx
+        tracked_count = 0
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for post in posts:
+                post_id = post['id']
+                title = post['title'][:30]  # First 30 chars
+                
+                try:
+                    # Query the post to trigger tracking
+                    response = await client.get(f"http://127.0.0.1:8000/api/counts/{post_id}")
+                    
+                    if response.status_code == 200:
+                        tracked_count += 1
+                        print(f"   ✓ Tracked post {post_id}: {title}")
+                    else:
+                        print(f"   ⚠️ Post {post_id} returned status {response.status_code}")
+                        
+                except Exception as e:
+                    print(f"   ✗ Failed to track post {post_id}: {e}")
+        
+        print(f"✅ Auto-tracking complete! Tracked {tracked_count}/{len(posts)} posts")
+        print(f"   Posts will appear in dashboard after first scheduler run (~30s)")
+        
+    except Exception as e:
+        print(f"⚠️ Auto-tracking failed: {e}")
+        print("   Posts can still be tracked manually via API calls")
+
+@app.get("/api/posts", tags=["Posts"])
+def list_tracked_posts():
+    """
+    List all posts that have been tracked in the DP system.
+    Returns post IDs with titles fetched from Fider database.
+    """
+    with get_dp_connection() as dp_conn:
+        cursor = dp_conn.cursor()
+        
+        # Get all unique post IDs that have been tracked
+        cursor.execute("""
+            SELECT DISTINCT post_id
+            FROM dp_releases
+            ORDER BY post_id
+        """)
+        
+        tracked_posts = cursor.fetchall()
+        post_ids = [row['post_id'] for row in tracked_posts]
+    
+    # Now fetch titles from Fider database
+    posts = []
+    with get_fider_connection() as fider_conn:
+        cursor = fider_conn.cursor()
+        
+        for post_id in post_ids:
+            try:
+                cursor.execute("""
+                    SELECT id, title, description, slug
+                    FROM posts
+                    WHERE id = %s
+                """, (post_id,))
+                
+                post = cursor.fetchone()
+                
+                if post:
+                    posts.append({
+                        "id": post['id'],
+                        "title": post['title'],
+                        "description": post['description'],
+                        "slug": post['slug']
+                    })
+            except Exception as e:
+                print(f"Error fetching post {post_id}: {e}")
+                # If can't fetch from Fider, use generic title
+                posts.append({
+                    "id": post_id,
+                    "title": f"Feature Request #{post_id}",
+                    "description": None,
+                    "slug": f"post-{post_id}"
+                })
+    
+    return {
+        "total": len(posts),
+        "posts": posts
+    }
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize scheduler on startup"""
     from .window_scheduler import start_scheduler
+    import asyncio
+    
     start_scheduler()
+    
     print("✅ DP Sidecar API started")
     print(f"   Mode: {'DEMO' if DEMO_MODE else 'PRODUCTION'}")
     print(f"   Threshold: {THRESHOLD} votes")
     print(f"   Epsilon per query: {EPSILON_PER_QUERY}")
+    
+    # Schedule auto-tracking to run after startup completes
+    asyncio.create_task(delayed_auto_track())
+
+
+async def delayed_auto_track():
+    """Run auto-tracking after API is fully ready"""
+    import asyncio
+    
+    # Wait for API to be fully operational
+    await asyncio.sleep(5)
+    
+    await auto_track_all_posts()
 
 
 if __name__ == "__main__":
