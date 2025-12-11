@@ -2,9 +2,9 @@
 
 A privacy-preserving layer for voting systems that protects individual votes while maintaining utility for decision-making.
 
-**Course Project:** CS527 Privacy-Preserving Systems, Boston University  
+**Course Project:** DS593 Privacy-Concious Computer System, Boston University  
 **Authors:** Dang Dinh, Yixin Lyu  
-**Academic Year:** Fall 2024
+**Academic Year:** Fall 2025
 
 ---
 
@@ -171,12 +171,6 @@ dp-sidecar-project/
 
 ### Differential Privacy
 
-For any two datasets D₁ and D₂ differing by one person:
-
-```
-Pr[M(D₁) ∈ S] / Pr[M(D₂) ∈ S] ≤ e^ε
-```
-
 **Where:** ε = 0.5 per noise generation, Total ε ≤ 20.0
 
 ### Attack Resistance
@@ -204,7 +198,7 @@ Pr[M(D₁) ∈ S] / Pr[M(D₂) ∈ S] ≤ e^ε
 
 ### Infrastructure
 - Docker & Docker Compose
-- Fider (stable)
+- Fider (Base voting platform)
 
 ---
 
@@ -214,6 +208,7 @@ Pr[M(D₁) ∈ S] / Pr[M(D₂) ∈ S] ≤ e^ε
 
 - Docker & Docker Compose
 - Python 3.11+
+- Git (for cloning)
 
 ### Quick Setup
 
@@ -379,7 +374,7 @@ docker-compose down && docker-compose up -d
 ## 📧 Contact
 
 **Authors:** Dang Dinh, Yixin Lyu  
-**Course:** CS527 Privacy-Preserving Systems, Fall 2024  
+**Course:** CDSDS293 Privacy-Concious, Fall 2025  
 **Institution:** Boston University
 
 ---
