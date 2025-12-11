@@ -345,6 +345,7 @@ docker ps
 docker-compose down && docker-compose up -d
 
 # Use 127.0.0.1 instead of localhost (Windows)
+# Check if the port is using by another program 
 ```
 
 **Posts not showing:**
@@ -360,14 +361,6 @@ docker-compose down && docker-compose up -d
 # Look for "🚀 Scheduler started" in logs
 # Restart API
 ```
-
----
-
-## 📖 References
-
-1. Dwork, C., & Roth, A. (2014). *The Algorithmic Foundations of Differential Privacy.*
-2. Apple Differential Privacy Team. (2017). *Learning with Privacy at Scale.*
-3. OpenDP Team. OpenDP Library. https://opendp.org
 
 ---
 
