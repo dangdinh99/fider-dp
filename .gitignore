@@ -1,2 +1,14 @@
-dp-sidecar/test_flow.py
-venv/
+# Virtual environments (all levels)
+**/venv/
+**/.venv/
+**/env/
+
+# Python
+__pycache__/
+*.pyc
+
+# Test files
+**/test_flow.py
+
+# OS
+**/.DS_Store
