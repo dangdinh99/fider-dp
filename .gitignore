@@ -2,6 +2,7 @@
 **/venv/
 **/.venv/
 **/env/
+dp-sidecar/venv/
 
 # Python
 __pycache__/
@@ -11,4 +12,4 @@ __pycache__/
 **/test_flow.py
 
 # OS
-**/.DS_Store
+/.DS_Store
